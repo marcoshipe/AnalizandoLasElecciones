@@ -1,108 +1,131 @@
-import pickle
 import locale
-from locale import LC_NUMERIC, atof, atoi
-from collections import namedtuple
-from selenium import webdriver
+from locale import atof, atoi
+import datetime
+from lxml import html
+import json
+from jsoncomment import JsonComment
+import requests
 
-Secciones_y_municipios = namedtuple('Secciones_y_municipios', ['secciones', 'municipios'])
-Info_seccion_municipio = namedtuple('Info_seccion_municipio', ['info_general', 'info_por_partido'])
-Info_general = namedtuple('Info_general', ['mesas_totales', 'mesas_escrutadas', 'votos_emitidos', 'votos_no_emitidos',
-                                           'votos_en_blanco', 'votos_nulos', 'votos_rec_imp_com'])
-Info_partido = namedtuple('Info_partido', ['votos_totales', 'listas'])
-
-
-def obtener_datos_completos(file_name):
-    locale.setlocale(LC_NUMERIC, 'es_AR.utf8')
-    datos = {}
-    driver = webdriver.Firefox()
-    driver.get('http://www.resultados.gob.ar/escrutinio/dat99/DDN99999P.htm')
-    assert 'Elecciones Argentinas del 13 de agosto - Diputados Nacionales' in driver.title
-
-    # iterate over all provincias
-    provincias_links = []
-    for provincia_elem in driver.find_elements_by_css_selector('#interiorindicesmunicipios > .indices > li'):
-        for a_elem in provincia_elem.find_elements_by_css_selector('a'):
-            if a_elem.value_of_css_property('display') != 'none':
-                datos[a_elem.text] = {}
-                provincias_links.append(a_elem.get_attribute('href'))
-    for provincia_link in provincias_links:
-        driver.get(provincia_link)
-        por_cada_provincia(driver, datos)
-
-    save_obj_to_file(datos, file_name)
-    driver.close()
+year = 2017
+file_name = 'PASO_2017_ultimo_provisorio'
 
 
-def por_cada_provincia(driver, datos):
-    # iterate over all municipios
-    municipios_links = []
-    for municipio_a_elem in driver.find_elements_by_css_selector('#interiorindicesmunicipios > ul > .act > .municipios '
-                                                                 '> ul > li > a'):
-        municipios_links.append(municipio_a_elem.get_attribute('href'))
-    for municipio_link in municipios_links:
-        driver.get(municipio_link)
-        por_cada_ciudad(driver, datos)
+def main():
+    locale.setlocale(locale.LC_NUMERIC, 'es_AR.utf8')  # used to convert string to int or float correctly
+    data = {}
+    main_url = 'http://www.resultados.gob.ar/escrutinio/dat99/'
+
+    # Get the json with the info to get cities's links
+    js = requests.get(
+        'http://www.resultados.gob.ar/javascript/mun.js').text  # can't use relative url because a bug in requests
+    string_json = js[js.find('['):js.rfind(';')]  # crop the js to obtain the json (is inside a global variable)
+    parser = JsonComment(json)  # needed because the json have trailing commas inside
+    municipios_json = parser.loads(string_json)
+
+    # Get the provinces ids and names (id is necessary to obtain the cities's links)
+    main_page = requests.get(main_url + 'DDN99999P.htm')
+    main_page_root = html.fromstring(main_page.content)
+    provincias = {}  # provincias = {provincia_id: provincia_name, ...}
+    for elem in main_page_root.cssselect('#interiorindicesmunicipios > .indices > li'):
+        provincia_id = elem.cssselect('span')[0].get('id')[1:]
+        for a_elem in elem.cssselect('a'):
+            if not a_elem.get('class') or 'linkmuninojs' not in a_elem.get('class'):
+                provincias[provincia_id] = a_elem.text
+
+    # Get the cities's names and links
+    municipios = []  # municipios = [(provincia_name, municipio_name, municipio_link), ...]
+    for provincia_obj in municipios_json:
+        provincia_id = provincia_obj['cod']
+        provincia_name = provincias[provincia_id]
+        data[provincia_name] = {}
+        for municipio_obj in provincia_obj['mun']:
+            municipio_id = municipio_obj['cod']
+            municipio_name = municipio_obj['nom']
+            # according to general.js, toggleMunicipios function:
+            municipio_link = main_url + '../dat' + provincia_id + '/DDN' + provincia_id + municipio_id + 'A.htm'
+            municipios.append((provincia_name, municipio_name, municipio_link))
+
+    # Get the categories for each city
+    categorias = []  # categorias = [(provincia_name, municipio_name, categoria_name, categoria_link), ...]
+    for provincia_name, municipio_name, municipio_link in municipios:
+        municipio_page_root = html.fromstring(requests.get(municipio_link).content)
+        for categoria_elem in municipio_page_root.cssselect('#menubotones > ul > li'):
+            categoria_name = categoria_elem.cssselect('a')[0].text
+            if 'act' in categoria_elem.get('class'):
+                # When you get the municipio_page, you get one of the categoria_page
+                # So instead of add it to categorias array, you can call get_data_from_ciudad_categoria with the
+                # municipio_page_root and don't need to visit the link twice
+                get_data_from_ciudad_categoria(data, provincia_name, municipio_name, categoria_name,
+                                               municipio_page_root)
+            else:
+                categoria_link = municipio_link[:municipio_link.rfind('/') + 1] + \
+                                 categoria_elem.cssselect('a')[0].get('href')
+                categorias.append((provincia_name, municipio_name, categoria_name, categoria_link))
+
+    # Get the data for every category of every city
+    for provincia_name, municipio_name, categoria_name, categoria_link in categorias:
+        get_data_from_ciudad_categoria_link(data, provincia_name, municipio_name, categoria_name, categoria_link)
+
+    save_data_to_json_file(data)
 
 
-def por_cada_ciudad(driver, datos):
-    categorias_link = []
-    (provincia, municipio) = driver.find_element_by_css_selector('#ambito > div > p').text.split(' - ')
-    for categoria_a_elem in driver.find_elements_by_css_selector('#menubotones > ul > li > a'):
-        categorias_link.append(categoria_a_elem.get_attribute('href'))
-    for categoria_link in categorias_link:
-        driver.get(categoria_link)
-        # La categoria la trae como uppercase por una prop del css
-        categoria = driver.find_element_by_css_selector('#titulo > p').text
-        if categoria not in datos[provincia]:
-            datos[provincia][categoria] = Secciones_y_municipios(secciones={}, municipios={})
-        seccion_municipio_item = get_data_ciudad(driver)
-        if municipio.startswith('Sección'):
-            datos[provincia][categoria].secciones[municipio] = seccion_municipio_item
-        else:
-            datos[provincia][categoria].municipios[municipio] = seccion_municipio_item
+def get_data_from_ciudad_categoria_link(data, provincia_name, municipio_name, categoria_name, categoria_link):
+    get_data_from_ciudad_categoria(data, provincia_name, municipio_name, categoria_name,
+                                   html.fromstring(requests.get(categoria_link).content))
 
 
-def get_data_ciudad(driver):
-    # info_general = {}
-    for mesa_elem in driver.find_elements_by_css_selector('.mesasEscrutadas > p'):
+def get_data_from_ciudad_categoria(data, provincia_name, municipio_name, categoria_name, categoria_page_root):
+    date_time_string = categoria_page_root.cssselect('#fechacorta > p')[0].text.split(' ')
+    (hour, minute) = date_time_string[3].split(':')
+    (day, month) = date_time_string[5].split('/')
+    date_time = datetime.datetime(year, int(month), int(day), int(hour), int(minute))
+
+    for mesa_elem in categoria_page_root.cssselect('.mesasEscrutadas > p'):
         if mesa_elem.text.startswith('Mesas totales: '):
-            mesas_totales = atoi(mesa_elem.text.split(' ')[2])
+            mesas_totales = atoi(mesa_elem.cssselect('span')[0].text)
         elif mesa_elem.text.startswith('Mesas escrutadas: '):
             mesas_escrutadas = atoi(mesa_elem.text.split(' ')[2])
-    votos_emitidos = atoi(driver.find_element_by_css_selector('#tablavotos > tbody > .electores > .vot').text)
-    for participacion_elem in driver.find_elements_by_css_selector('.participacion > p'):
+    votos_emitidos = atoi(categoria_page_root.cssselect('#tablavotos > tbody > .electores > .vot')[0].text)
+    for participacion_elem in categoria_page_root.cssselect('.participacion > p'):
         if participacion_elem.text.startswith('Participación sobre escrutado:'):
-            porcentaje_votos_emitidos = atof(participacion_elem.text.split(' ')[3][:-1])/100
+            porcentaje_votos_emitidos = atof(participacion_elem.cssselect('span')[0].text[:-1])/100
             porcentaje_votos_no_emitidos = 1-porcentaje_votos_emitidos
             votos_no_emitidos = round(porcentaje_votos_no_emitidos*votos_emitidos/porcentaje_votos_emitidos)
-    votos_en_blanco = atoi(driver.find_element_by_css_selector('#tablavotos > tbody > .blan > .vot').text)
-    votos_nulos = atoi(driver.find_element_by_css_selector('#tablavotos > tbody > .nulos > .vot').text)
-    votos_rec_imp_com = atoi(driver.find_element_by_css_selector('#tablavotos > tbody > .recimp > .vot').text)
-    info_general = Info_general(mesas_totales=mesas_totales, mesas_escrutadas=mesas_escrutadas,
-                                votos_emitidos=votos_emitidos, votos_no_emitidos=votos_no_emitidos,
-                                votos_en_blanco=votos_en_blanco, votos_nulos=votos_nulos,
-                                votos_rec_imp_com=votos_rec_imp_com)
+    votos_en_blanco = atoi(categoria_page_root.cssselect('#tablavotos > tbody > .blan > .vot')[0].text)
+    votos_nulos = atoi(categoria_page_root.cssselect('#tablavotos > tbody > .nulos > .vot')[0].text)
+    votos_rec_imp_com = atoi(categoria_page_root.cssselect('#tablavotos > tbody > .recimp > .vot')[0].text)
+    info_general = {'mesas_totales': mesas_totales, 'mesas_escrutadas': mesas_escrutadas,
+                    'votos_emitidos': votos_emitidos, 'votos_no_emitidos': votos_no_emitidos,
+                    'votos_en_blanco': votos_en_blanco, 'votos_nulos': votos_nulos,
+                    'votos_rec_imp_com': votos_rec_imp_com}
 
     info_por_partido = {}
     listas_partido_actual = None
-    for agrup_elem in driver.find_elements_by_css_selector('#tablaagrupaciones > tbody > tr'):
-        nombre_partido_lista = agrup_elem.find_element_by_css_selector('.denom').text
-        votos_partido_lista = atoi(agrup_elem.find_element_by_css_selector('.vot').text)
-        if 'agrup' in agrup_elem.get_attribute('class'):
+    for agrup_elem in categoria_page_root.cssselect('#tablaagrupaciones > tbody > tr'):
+        nombre_partido_lista = agrup_elem.cssselect('.denom')[0].text
+        votos_partido_lista = atoi(agrup_elem.cssselect('.vot')[0].text)
+        if 'agrup' in agrup_elem.get('class'):
             # Info de un partido:
-            info_partido_actual = Info_partido(votos_totales=votos_partido_lista, listas={})
+            info_partido_actual = {'votos_totales': votos_partido_lista, 'listas': {}}
             info_por_partido[nombre_partido_lista] = info_partido_actual
-            listas_partido_actual = info_partido_actual.listas
-        elif 'lista' in agrup_elem.get_attribute('class'):
+            listas_partido_actual = info_partido_actual['listas']
+        elif 'lista' in agrup_elem.get('class'):
             listas_partido_actual[nombre_partido_lista] = votos_partido_lista
 
-    return Info_seccion_municipio(info_general=info_general, info_por_partido=info_por_partido)
+    if municipio_name.startswith('Sección'):
+        mun = 'secciones'
+    else:
+        mun = 'municipios'
+    if categoria_name not in data[provincia_name]:
+        data[provincia_name][categoria_name] = {'secciones': {}, 'municipios': {}}
+    info = {date_time.isoformat(): {'info_general': info_general, 'info_por_partido': info_por_partido}}
+    data[provincia_name][categoria_name][mun][municipio_name] = info
 
 
-def save_obj_to_file(obj, file_name):
-    with open('data/' + file_name + '.pkl', 'wb') as f:
-        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+def save_data_to_json_file(data):
+    with open('data/' + file_name + '.json', 'w') as f:
+        json.dump(data, f, sort_keys=True, indent=4, ensure_ascii=False)
 
 
 if __name__ == '__main__':
-    obtener_datos_completos('datos_pais_elecciones_paso_2017_final_aux')
+    main()
